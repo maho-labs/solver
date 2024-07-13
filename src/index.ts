@@ -1,8 +1,9 @@
-import { createPublicClient, createWalletClient, http } from "viem";
+import { createPublicClient, createWalletClient, encodeFunctionData, http, prepareEncodeFunctionData, type PrivateKeyAccount } from "viem";
 import * as utils from "./utils";
 import { mainnet } from "viem/chains";
 import { privateKeyToAccount } from "viem/accounts";
-import { abi } from "./contracts/SettlementABI";
+import { abi as settlementAbi } from "./contracts/SettlementABI";
+import { abi as erc20Abi } from "./contracts/ERC20ABI";
 
 // The Worker's environment bindings. See `wrangler.toml` file.
 interface Bindings {
@@ -51,21 +52,25 @@ const worker: ExportedHandler<Bindings> = {
             body?.chainId
           ) {
             // start solving
-            const contractAddress = "0x"
+            const contractAddress = body.originSettlementContract;
+
+            const transactionCount = await publicClient.getTransactionCount({
+              address: contractAddress,
+            })
 
             const crossChainOrder = {
-              settlementContract: body.settlementContract,
+              settlementContract: contractAddress,
               swapper: body.swapper,
-              nonce: 0,
+              nonce: transactionCount + 1,
               originChainId: body.chainId,
-              initiateDeadline: 0,
-              fillDeadline: 0,
-              orderData: "0x",
+              initiateDeadline: body.initiateDeadline,
+              fillDeadline: body.fillDeadline,
+              orderData: body.orderData,
             };
 
             const resolve: any = await publicClient.readContract({
               address: contractAddress,
-              abi: abi,
+              abi: settlementAbi,
               functionName: "resolve",
               args: [
                 crossChainOrder,
@@ -81,12 +86,12 @@ const worker: ExportedHandler<Bindings> = {
 
             const { request } = await publicClient.simulateContract({
               address: contractAddress,
-              abi,
+              abi: settlementAbi,
               functionName: "initiate",
               args: [
                 {
                   ...crossChainOrder,
-                  orderData: resolvedCrossChainOrder,
+                  nonce: transactionCount + 2,
                 },
                 body.signature,
                 body.fillerData,
@@ -95,6 +100,19 @@ const worker: ExportedHandler<Bindings> = {
             })
 
             const initiateTxHash = await wallet.writeContract(request)
+
+            const tx = await publicClient.waitForTransactionReceipt(
+              { hash: initiateTxHash }
+            );
+
+            if (tx.status == 'success') {
+              fillOrder(
+                resolvedCrossChainOrder.swapperOutputs,
+                body.destinationSettlementContract,
+                crossChainOrder,
+                account
+              );
+            }
           }
 
           return utils.reply("Solving...");
@@ -113,6 +131,85 @@ const worker: ExportedHandler<Bindings> = {
       return utils.toError(msg, 500);
     }
   }
-};
+}
+
+const fillOrder = async (
+  swapperOutputs: {
+    token: `0x${string}`,
+    amount: number, recipient:
+    `0x${string}`,
+    chainId: number
+  }[],
+  destinationContractAddress: `0x${string}`,
+  crossChainOrder: any,
+  account: PrivateKeyAccount
+) => {
+  const solutionSegments: { to: `0x${string}`, data: string, value: number }[] = [];
+
+  const transfer = prepareEncodeFunctionData({
+    abi: erc20Abi,
+    functionName: "transfer",
+  })
+
+  swapperOutputs.forEach((output) => {
+    const data = encodeFunctionData({
+      ...transfer,
+      args: [
+        output.recipient,
+        output.amount,
+      ]
+    })
+
+    solutionSegments.push({
+      to: output.token,
+      data,
+      value: output.amount,
+    })
+  })
+
+  const { request } = await publicClient.simulateContract({
+    address: destinationContractAddress,
+    abi: settlementAbi,
+    functionName: "fill",
+    args: [
+      crossChainOrder,
+      solutionSegments,
+    ],
+    account,
+  })
+
+  const initiateTxHash = await wallet.writeContract(request);
+
+  const tx = await publicClient.waitForTransactionReceipt(
+    { hash: initiateTxHash }
+  );
+
+  if (tx.status == 'success') {
+    return utils.reply("Order filled successfully.");
+  }
+}
+
+const claimOrder = async (originSettlementContract: `0x${string}`, crossChainOrder: any, account: PrivateKeyAccount) => {
+  const { request } = await publicClient.simulateContract({
+    address: originSettlementContract,
+    abi: settlementAbi,
+    functionName: "claim",
+    args: [
+      crossChainOrder,
+    ],
+    account,
+  })
+
+  const initiateTxHash = await wallet.writeContract(request);
+
+  const tx = await publicClient.waitForTransactionReceipt(
+    { hash: initiateTxHash }
+  );
+
+  if (tx.status == 'success') {
+    return utils.reply("Order claimed successfully.");
+  }
+}
+
 // Export for discoverability
 export default worker;
